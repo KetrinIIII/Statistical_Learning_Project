@@ -1,0 +1,1013 @@
+---
+title: "Prediction of Attrition"
+author: "Hristova Ketrin"
+date: "2023-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Employee Attrition is when employees end their formal relationship with an organization, so the gradual loss or withdrawal of employees over a period of time. 
+Employees are arguably the most important asset of any organization, and one of the most critical issues facing organizations today is how to retain their employees.
+
+# Aim
+The main aim of this project is to predict which employees are most likely to leave and use that information to design interventions to retain them.
+
+# Libraries
+```{r}
+library(pROC)
+library(tidyverse)
+library(tidymodels)
+library(scales)
+library(janitor)
+library(gridExtra)
+library(glue)
+library(ggcorrplot)
+library(vip)
+library(vroom)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(fpp3)
+```
+
+
+# Loading Data
+```{r}
+hr <- read_csv("WA_Fn-UseC_-HR-Employee-Attrition.csv") %>% clean_names()
+
+glimpse(hr)
+
+paste0("There are ",sum(is.na(hr)), " missing values in the dataset")
+
+```
+- The dataset contains 1470 observations and 35 variables.
+
+- There are no missing values.
+
+- Variables type:
+  - NUMERICAL VARIABLES: 
+    - Related to personal information: age, distance_from_home, employee_number (id variable)
+    - Related to income: hourly_rate, daily_rate, monthly_rate, monthly_income, percent_salary_hike
+    - Related to time in company: years_at_company, years_in_current_role, years_since_last_promotion, years_with_curr_manager, total_working_years
+    - other: num_companies_worked, standard_hours(to delete), training_times_last_year, employee_count (to delete)
+  - CATEGORICAL VARIABLES: 
+    - Binary variables: attrition(target variable),
+    gender, over18 (to delete),
+    over_time
+    - Nominal variables: department, education_field, job_role, marital_status
+    - Ordinal variables: 
+      - Ordinal regarding satisfaction and performance : environment_satisfaction, job_satisfaction, relationship_satisfaction, work_life_balance,job_involvement,performance_rating
+      - Other ordinal: business_travel, education, job_level, stock_option_level
+
+
+# Preprocessing
+
+- Transform some of the binary variables into a 1/0 format.
+- Reclassify some variables into factors.
+- Remove unneeded features (employee_count, standart_hours and over18 have the same value for all observations).
+- Devide the data into a testing and training sets.
+
+```{r}
+hr <-
+  hr %>%
+  mutate(across(c(attrition,over18,over_time),
+               ~ if_else(. == "Yes",1,0))) %>% 
+  mutate(across(c(attrition,over18,over_time),
+               ~ as.factor(.))) %>% 
+  mutate(attrition = fct_relevel(attrition,c("1","0"))) %>%
+  # Binary categorical
+  mutate(across(c(department, education_field,
+                  job_role, marital_status),~ as.factor(.))) %>%
+   # Nominal categorical
+  mutate(across(c(environment_satisfaction, job_satisfaction,
+                  relationship_satisfaction,
+                  work_life_balance,business_travel, education ,
+                  job_involvement,job_level, stock_option_level,
+                  performance_rating),
+                ~as.ordered(.))) %>%
+   # Ordinal categorical
+  mutate(business_travel = factor(business_travel, ordered = TRUE,
+                                  levels = c("Non-Travel",
+                                             "Travel_Rarely","Travel_Frequently"))) %>%
+  # Reordering
+  dplyr::select(-employee_count,-standard_hours,-over18)
+  # Removing non pertinant variables
+
+
+# Dividing features into vectors to faciltate plotting
+numerical <- c("age", "distance_from_home","hourly_rate",
+               "daily_rate", "monthly_rate","monthly_income",
+               "percent_salary_hike","years_at_company",
+               "years_in_current_role","years_since_last_promotion",
+               "years_with_curr_manager","total_working_years",
+               "num_companies_worked","training_times_last_year") 
+
+categorical <- c("gender","over_time","department",
+                 "education_field", "job_role", "marital_status")
+
+ordinal <- c("environment_satisfaction", "job_satisfaction",
+             "relationship_satisfaction","work_life_balance",
+             "job_involvement","performance_rating",
+             "business_travel", "education","job_level",
+             "stock_option_level")
+
+# Creating a train/test split
+set.seed(1234)
+spl <- initial_split(data = hr, strata = attrition, prop = 0.8)
+train <- training(spl)
+test <- testing(spl)
+```
+
+## Exploratory data analysis
+
+Calculate turnover rate (percentage of employees leaving a company within a certain period of time).
+
+```{r}
+hr %>% group_by(attrition) %>% dplyr::summarize(N = n()) %>%
+  ggplot(aes(attrition, N, fill = attrition)) +
+  geom_col() +
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") + 
+  geom_text(aes(label = N), size = 5, vjust = 1.2, color = "#FFFFFF") + 
+  ggtitle("Count of Employee Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15)) +
+  labs(x = "Attrition", y = "Count")
+```
+
+```{r}
+hr %>% group_by(attrition) %>% dplyr::summarize(N = n()) %>% mutate(percent = N*100/sum(N)) %>%
+  ggplot(aes("", attrition, fill = attrition)) +
+  geom_bar(width = 1, stat = "identity", color = "white") +
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") + 
+  coord_polar("y", start = 0) +
+  ggtitle("Percent of Employee Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15)) +
+  geom_text(aes(label = paste0(round(percent, 1), "%")), position = position_stack(vjust = 0.5), color = "white")
+```
+
+1,233 employees(83.9%) did not leave the organization while 237 employees(16.1%) did leave the organization.
+The dataset is considered imbalanced since more people stay in the organization than they actually leave.
+
+## Correlation between variables (independent variables)
+
+# Age distribution by attrition
+
+```{r}
+ggplot(hr, aes(x=age, fill=attrition, color=attrition)) +
+  geom_density(position="identity", alpha=0.5) + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Density plot of Age") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15), legend.position="bottom") +
+  labs(x = "Age")
+```
+
+The majority of employees are between 28-36 years. It seems to a large majority of those who left were relatively younger.
+
+# Maritial Status by Attrition
+```{r}
+hr %>% group_by(attrition, marital_status) %>% dplyr::summarize(N = n()) %>% mutate(countT = sum(N)) %>%
+  group_by(attrition, marital_status, add=TRUE) %>% mutate(per=paste0(round(100*N/countT,1),'%')) %>%
+  ggplot(aes(x=attrition, y=N, fill=marital_status)) + 
+  geom_bar(stat="identity", position=position_dodge()) + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set2") +
+  geom_text(aes(label = per), size = 4, vjust = 1.2, color = "#FFFFFF", position = position_dodge(0.9)) + 
+  ggtitle("Marital Status by Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15)) +
+  labs(x = "Attrition", y = "Count")
+
+```
+
+The majority of those who left was relatively single.
+
+# Monthly Income by Attrition
+
+```{r}
+ggplot(hr, aes(x=attrition, y=monthly_income, color=attrition, fill=attrition)) +
+  geom_boxplot() + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") +
+  scale_color_manual(values=c("#661304", "#040242")) +
+  ggtitle("Monthly Income by Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15)) +
+  labs(x = "Attrition", y = "Monthly Income")
+```
+
+To a large majority of those who left had a relatively lower monthly income.
+
+# Job Satisfaction by Attrition
+
+```{r}
+ggplot(hr, aes(x=attrition, y=job_satisfaction, color=attrition, fill=attrition)) +
+  geom_boxplot() + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") +
+  scale_color_manual(values=c("#661304", "#040242")) +
+  ggtitle("Job Satisfaction by Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15)) +
+  labs(x = "Attrition", y = "Job Satisfaction")
+```
+
+It seems to a large majority of those who left had a relatively lower job satisfaction.
+
+# Total Working Years by Attrition
+
+```{r}
+ggplot(hr, aes(x=total_working_years, fill=attrition, color=attrition)) +
+  geom_density(position="identity", alpha=0.5) + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Density plot of Total Working Years") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15), legend.position="bottom") +
+  labs(x = "Total Working Years") 
+```
+
+It seems to a large majority of those who left had a relatively shorter working years in the organization.
+
+# Distance from Work by Attrition
+
+```{r}
+ggplot(hr, aes(x=distance_from_home, fill=attrition, color=attrition)) +
+  geom_density(position="identity", alpha=0.5) + 
+  theme_bw() + 
+  scale_fill_brewer(palette="Set1") +
+  ggtitle("Distance from Work by Attrition") + 
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15), legend.position="bottom") +
+  labs(x = "Distance from Work")
+```
+It seems to a large majority of those who left had a relatively lower distance from work.
+
+## detection of outlier
+```{r}
+set.seed(1)
+mod <- lm(as.numeric(attrition) ~ ., data=hr) #model
+cooksd <- cooks.distance(mod) # distance
+# Plotting cook's distance
+plot(cooksd, pch="*", cex=2, main="Outliers using Cooks Distance") %>% #plot
+abline(h = 5*mean(cooksd, na.rm=T), col="black") %>%  # cut-off line
+text(x=1:length(cooksd)+1, y=cooksd, labels=ifelse(cooksd>5*mean(cooksd, na.rm=T),names(cooksd),""), col="red") 
+```
+```{r}
+# Row numbers with outliers
+out.rows <- as.numeric(names(cooksd)[(cooksd > 5*mean(cooksd, na.rm=T))]) 
+out.rows
+```
+```{r}
+# Removing outlier rows as they create unwanted significant associated
+employee <- hr[-out.rows,]
+employee1<-hr[-out.rows,]
+```
+
+
+### Checking for correations between numerical features
+
+It is important to check for possible correletions between numeric predictors. 
+
+```{r}
+ggcorrplot(cor(train %>%
+                     dplyr::select(any_of(numerical)) %>%
+                     dplyr::rename("dist" = "distance_from_home",
+                            "rate_h" = "hourly_rate",
+                            "rate_d" = "daily_rate",
+                            "rate_m" = "monthly_rate",
+                            "income" = "monthly_income",
+                            "raise_%" = "percent_salary_hike",
+                            "y_comp" = "years_at_company",
+                            "y_role" = "years_in_current_role",
+                            "y_promo" = "years_since_last_promotion",
+                            "y_w_boss" = "years_with_curr_manager",
+                            "work_y" = "total_working_years",
+                            "past_job" = "num_companies_worked",
+                            "train_time" = "training_times_last_year")),
+         method = 'square', type = 'lower',colors = c("#E46726", "white", "#6D9EC1"))
+
+```
+
+- The variables that are problematic are: distance_from_home, hourly_rate, daily_rate, monthly_rate, percent_salary_hike and training_times_last_year.
+
+I will not use them in the prediction stage.
+
+```{r}
+numerical_proper <- c("age","monthly_income",
+               "years_at_company", "years_in_current_role",
+               "years_since_last_promotion", "years_with_curr_manager",
+               "total_working_years","num_companies_worked")
+
+ggcorrplot(cor(train %>%
+                     dplyr::select(any_of(numerical_proper)) %>%
+                     dplyr::rename("income" = "monthly_income",
+                            "y_comp" = "years_at_company",
+                            "y_role" = "years_in_current_role",
+                            "y_promo" = "years_since_last_promotion",
+                            "y_w_boss" = "years_with_curr_manager",
+                            "work_y" = "total_working_years",
+                            "past_job" = "num_companies_worked")),
+         method = 'square', type = 'lower',lab = TRUE,
+         colors = c("#E46726", "white", "#6D9EC1"))
+
+```
+- The correlation plot without the randomaly generated variables shows strong possitive correlations between four paires of features:
+ years_in_current_role and years_at_company
+ years_in_current_role and years_with_curr_manager
+ years_at_company and years_with_curr_manager
+ monthly_income and total_working_years
+  
+# Conclusions EDA analysis
+
+- The profile of a worker which is the most like to churn:
+  1. Young
+  2. Low salary
+  3. Working overtime
+  4. Single
+  5. Working as a sales rep or a lab tech
+  6. Has a low overall satisfaction level
+  7. Travels frequently
+  8. Has stock level set to 0
+
+```{r}
+post_eda_processing <- function(tbl) {
+  tbl %>%
+    mutate(total_satisfaction =
+           as.numeric(environment_satisfaction) +
+           as.numeric(job_satisfaction) +
+           as.numeric(relationship_satisfaction) +
+           as.numeric(work_life_balance) +
+           as.numeric(job_involvement)) %>%
+  # Creating feature
+    #select(-c(environment_satisfaction,job_satisfaction,relationship_satisfaction,
+    #          work_life_balance,job_involvement)) %>%
+  # Removing components of total_satisfaction
+    dplyr::select(-c(distance_from_home,hourly_rate,daily_rate,monthly_rate,percent_salary_hike,
+              training_times_last_year)) %>%
+  # Removing randomly generated features
+    dplyr::select(-c(years_at_company))# %>%
+  # Reducing colliniarity
+  #  mutate(attrition = fct_rev(attrition))
+  # Reversing the order of levels to predict churn and not stay
+  
+  
+}
+
+hr <- post_eda_processing(hr)
+train <- post_eda_processing(train)
+test <- post_eda_processing(test)
+
+```
+
+
+## Predicting attrition (Supervised Learning)
+
+```{r}
+hr_recipe <- recipe(data = train,formula = attrition ~ .) %>%
+  update_role(employee_number, new_role = "ID") %>%
+  step_normalize(any_of(c("age","monthly_income","total_satisfaction"))) %>%
+  step_dummy(all_nominal_predictors(),one_hot = TRUE) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_corr(all_predictors())
+
+
+hr_recipe %>% prep() %>% juice() %>% glimpse()
+
+```
+- The data is now preped and ready for fitting
+
+## Logistic Regression with all features
+
+fit a logistic model using all the predictors
+
+```{r}
+glm_spec <- 
+  logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+glm_model <- 
+  workflow() %>% 
+  add_recipe(hr_recipe) %>% 
+  add_model(glm_spec) %>%
+  fit(data =  train)
+
+glm_model %>% tidy() %>%
+  arrange(estimate) %>%
+  filter(p.value <= 0.05) %>%
+  mutate(term = fct_reorder(term,-estimate),
+         condition = if_else(estimate >=0,FALSE,TRUE)) %>%
+  ggplot(aes(x = term, y = estimate,fill = condition )) +
+  geom_col(width = 0.8,color = "black",alpha = 0.75) + 
+  geom_errorbar(aes(ymin = estimate - std.error * 1.96,
+                    ymax = estimate + std.error * 1.96),
+                width = 0.5, alpha = 0.5) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  coord_flip() +
+  labs(title = "Statisticly significant features (p.value < 0.05)",
+       subtitle = "bars going to the left: less chance to churn",
+       x = element_blank(), y = element_blank())
+```
+
+We fit the logistic regression on the training data.
+Now we should fit the model on the testing data in order to see how it preforms on unseen data.
+
+```{r}
+library(forecast)
+
+glm_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(glm_model,test),
+    predict(glm_model,test,type = "prob"))
+
+
+glm_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+
+
+conf_matrix <- table(glm_pred$attrition, glm_pred$.pred_class)
+
+accuracy_value <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+roc_auc_value <- roc(glm_pred$attrition, glm_pred$.pred_1)$auc
+
+lr1_metric_df <- data.frame(
+  model = "LR1",
+  accuracy = accuracy_value,
+  roc_auc = roc_auc_value
+)
+
+metric_df <- lr1_metric_df
+
+lr1_metric_df
+```
+
+This model has an accuracy score of 0.858 and and roc_auc score of 0.791
+
+### Logistic Regression with feature selection
+
+Now we perform a logistic model with only pertinant features taken in consideration.
+
+```{r}
+hr_recipe2 <- 
+  recipe(data = train, formula = attrition ~ total_working_years + monthly_income + job_involvement + job_role +
+           environment_satisfaction + work_life_balance + job_satisfaction + business_travel + 
+           over_time + marital_status + job_role + business_travel + job_level + years_with_curr_manager +
+           num_companies_worked + education_field + years_since_last_promotion) %>%
+  step_normalize(any_of(c("total_working_years", "monthly_income", "total_satisfaction", "years_with_curr_manager"))) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_nzv(all_nominal_predictors()) %>%
+  step_corr(all_predictors())
+
+glm_model2 <- 
+  workflow() %>% 
+  add_recipe(hr_recipe2) %>% 
+  add_model(glm_spec) %>%
+  fit(data = train)
+
+glm_pred <- bind_cols(
+  test["attrition"],
+  predict(glm_model2, test),
+  predict(glm_model2, test, type = "prob")
+)
+
+conf_matrix <- table(glm_pred$attrition, glm_pred$.pred_class)
+accuracy_value <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+roc_auc_value <- roc(glm_pred$attrition, glm_pred$.pred_1)$auc
+
+lr2_metric_df <- data.frame(
+  model = "LR2",
+  accuracy = accuracy_value,
+  roc_auc = roc_auc_value
+)
+
+metric_df <- rbind(metric_df, lr2_metric_df)
+
+lr2_metric_df
+```
+When using this model, the accuracy drops a bit while the value of roc_auc improves.
+
+## Lasso
+
+- Let's see if a lasso model outpreforms the regular logistic regression model
+
+```{r}
+# Creating folds for cross validation
+train_fold <- train %>% vfold_cv(5,strata = attrition)
+
+# Declaring the model we will use
+lasso_spec <- logistic_reg(penalty = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lasso_model <- 
+  workflow() %>%
+  add_recipe(hr_recipe) %>%
+  add_model(lasso_spec)
+
+# Creating the specification for our tune grid
+lambda_grid <- crossing(penalty = 10 ^ seq(-7,-0.5,0.1))
+
+lasso_grid <- tune_grid(lasso_model
+                        ,resamples = train_fold,
+                        grid = lambda_grid)
+
+highest_acc <- lasso_grid %>% 
+  select_best("accuracy",maximise = TRUE)
+
+lasso_grid %>% autoplot()
+```
+We correctly identified the best preforming penalty parameter, we can fit the model to the training data
+
+```{r}
+# Applying the tuning to our workflow
+lasso_model <- finalize_workflow(lasso_model,
+                  highest_acc) %>% fit(data = train)
+
+lasso_model %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_acc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance),
+         Sign = fct_rev(Sign)) %>%
+  top_n(15,wt = Importance) %>% 
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(color = "black", width = 0.8, alpha = 0.75) +
+  theme(legend.position = "none", axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+   labs(title = "Most important features",subtitle = "Red bars: more chance to churn", y = element_blank()) 
+```
+The model is properly fit and it's time to use the model to predict attrition.
+
+```{r}
+lasso_pred <- bind_cols(
+  test["attrition"],
+  predict(lasso_model, test),
+  predict(lasso_model, test, type = "prob")
+)
+
+conf_matrix <- table(lasso_pred$attrition, lasso_pred$.pred_class)
+accuracy_value <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+roc_auc_value <- roc(lasso_pred$attrition, lasso_pred$.pred_1)$auc
+
+l_metric_df <- data.frame(
+  model = "Lasso",
+  accuracy = accuracy_value,
+  roc_auc = roc_auc_value
+)
+
+metric_df <- rbind(metric_df, l_metric_df)
+
+l_metric_df %>% filter(model == "Lasso")
+```
+
+Using Lasso we get an accuracy score of 0.851 and an roc_auc score of  0.8031
+
+## Random forest
+
+Now let's build and tune a random forest model
+
+```{r}
+library(randomForest)
+
+set.seed(200515)
+
+forestFit <- randomForest(attrition ~., data = train, ntree=1000)
+
+importance(forestFit)
+```
+
+```{r}
+varImpPlot(forestFit)
+```
+
+```{r}
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()) %>%
+  set_mode("classification") %>% 
+  set_engine(engine = "ranger")
+
+
+rf_grid <-
+  crossing(mtry = c(9:17),min_n = c(seq(1,25,5)),trees = c(500))
+
+
+rf_model <- 
+  workflow() %>%
+  add_recipe(hr_recipe) %>%
+  add_model(rf_spec)
+
+
+rf_tune <- tune_grid(rf_model,
+          resamples = train_fold,
+          grid = rf_grid
+          )
+highest_acc <- rf_tune %>% select_best("accuracy")
+
+rf_tune %>% autoplot()
+rf_tune %>% collect_metrics() %>% arrange(-mean)
+```
+
+Now lets fit the model on the training and predict attrition from the testing set
+
+```{r}
+
+
+rf_model <- finalize_workflow(rf_model,
+                  highest_acc) %>% fit(data = train)
+
+rf_model %>%
+  pull_workflow_fit()
+
+rf_pred <-
+  bind_cols(
+    test["attrition"],
+    predict(rf_model,test),
+    predict(rf_model,test,type = "prob"))
+
+rf_pred %>% 
+  conf_mat(attrition, .pred_class) %>%
+  autoplot(type = "heatmap")
+
+
+
+conf_matrix <- table(rf_pred$attrition, rf_pred$.pred_class)
+accuracy_value <- sum(diag(conf_matrix)) / sum(conf_matrix)
+
+roc_auc_value <- roc(rf_pred$attrition, rf_pred$.pred_1)$auc
+
+rf_metric_df <- data.frame(
+  model = "RF",
+  accuracy = accuracy_value,
+  roc_auc = roc_auc_value
+)
+
+metric_df <- rbind(metric_df, rf_metric_df)
+
+rf_metric_df %>% filter(model == "RF")
+```
+Using Random Forest we get an accuracy score of 0.851 and an roc_auc score of  0.75
+
+## Decision Tree
+
+```{r}
+rtreeFit <- rpart(attrition ~ ., data=train)
+
+```
+
+The Feature Importance for Decision Tree Model is as follows
+```{r}
+var_imp <- data.frame(rtreeFit$variable.importance)
+var_imp$features <- rownames(var_imp)
+var_imp <- var_imp[, c(2, 1)]
+var_imp$importance <- round(var_imp$rtreeFit.variable.importance, 2)
+var_imp$rpart.tree.variable.importance <- NULL
+
+var_imp %>%
+  ggplot(aes(x=reorder(features, importance), y=importance, fill=features)) + 
+  geom_bar(stat='identity') + 
+  coord_flip() + 
+  theme_bw() + 
+  ggtitle("Feature Importance for Decision Tree Model") + 
+  labs(x = "Feature Importance") + labs(y = "Variable") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15), legend.position="none")
+```
+
+pruning was performed, and the result is as follows:
+
+```{r}
+prune_rtreeFit <- rpart::prune(rtreeFit, cp=0.016)
+rpart.plot(prune_rtreeFit, branch = 0.6)
+```
+
+```{r}
+pred_p <- predict(prune_rtreeFit, test, type = "class")
+
+accuracy_value_p <- sum(pred_p == test$attrition) / nrow(test)
+
+roc_value_p <- roc(as.numeric(test$attrition), as.numeric(pred_p))
+
+roc_auc_value_p <- roc_value_p$auc
+
+dt_p_metric_df <- data.frame(
+  model = "DT-P",
+  accuracy = accuracy_value_p,
+  roc_auc = roc_auc_value_p
+)
+
+metric_df <- rbind(metric_df, dt_p_metric_df)
+
+print(paste0("ROC : ",round(roc_value_p$auc, 3)))
+```
+
+```{r}
+prop.table(table(test$attrition, pred_p, dnn = c("Actual", "Predicted")), 1)
+```
+This Decision Tree model has a ROC score of 0.565, so it performed poorly
+
+## Support Vector Machine
+
+```{r}
+library(e1071)
+library(caret)
+
+svmData <- hr
+set.seed(123)
+indexes = sample(1:nrow(svmData), size=0.8*nrow(svmData))
+SVMtrain.Data <- svmData[indexes,]
+SVMtest.Data <- svmData[-indexes,]
+tuned <- tune(svm,factor(attrition)~.,data = SVMtrain.Data)
+svm.model <- svm(SVMtrain.Data$attrition~., data=SVMtrain.Data
+                 ,type="C-classification", gamma=tuned$best.model$gamma
+                 ,cost=tuned$best.model$cost
+                 ,kernel="radial")
+svm.prd <- predict(svm.model,newdata=SVMtest.Data)
+conf_matrix <- confusionMatrix(svm.prd,SVMtest.Data$attrition)
+
+accuracy_value <- conf_matrix$overall["Accuracy"]
+roc_value <- roc(as.numeric(SVMtest.Data$attrition), as.numeric(svm.prd))
+roc_auc_value <- roc_value$auc
+
+# Create the data frame
+svm_metric_df <- data.frame(
+  model = "SVM",
+  accuracy = accuracy_value,
+  roc_auc = roc_value$auc
+)
+row.names(svm_metric_df) <- NULL
+row.names(svm_metric_df)[1] <- "1"
+metric_df <- rbind(metric_df, svm_metric_df)
+
+```
+
+```{r}
+svm.plot <-plot.roc (as.numeric(SVMtest.Data$attrition), as.numeric(svm.prd),lwd=2, type="b", print.auc=TRUE,col ="blue")
+```
+
+Accuracy is  0.8605 and AUC is 0.573
+
+### Results
+
+```{r}
+library(kableExtra) # Visualization
+kable(metric_df) %>%
+  kable_styling(bootstrap_options = c("hover","condensed"))
+```
+
+## UNSUPERVISED LEARNING
+
+We are dealing with ‘people’ data, or data collected on persons; so we'll geared toward pulling insights from messy data to have a much greater utility for HR departments
+
+
+
+```{r}
+library(data.table) # Data Wrangling
+library(dplyr) # Data Wrangling
+library(tidyr) # Data Wrangling
+library(tibble) # Data Wrangling
+library(ggplot2) # Visualization
+library(gridExtra) # Visualization
+library(gplots) # Visualization
+library(Rtsne) # tSNE Clustering
+library(dbscan) # Density-Based Clustering (DBSCAN)
+library(FactoMineR) # Correspondence Analysis
+library(factoextra) # Correspondence Analysis
+library(cluster) # Gower's Distance
+library(GDAtools) # Computation of 'Burt Table'
+library(caret) # Machine Learning for Classification
+library(iml)
+```
+
+```{r}
+ibm_data = fread('WA_Fn-UseC_-HR-Employee-Attrition.csv',showProgress = TRUE)
+
+paste("Number of Rows (persons): ", nrow(ibm_data),
+      ", Number of Columns (variables): ", ncol(ibm_data),sep="")
+head(ibm_data)
+```
+
+
+
+```{r}
+# Dummy Code Variables
+ibm_data_dummy = ibm_data %>% mutate(Attrition_Yes = ifelse(Attrition=="Yes",1,0),Travel_rare=ifelse(BusinessTravel=="Travel_Rarely",1,0),Travel_none=ifelse(BusinessTravel=="Non-Travel",1,0),Department_HR=ifelse(Department=="Human Resources",1,0), Department_Sales=ifelse(Department=="Sales",1,0), EdField_HR=ifelse(EducationField=="Human Resources",1,0), Edfield_LifeSci=ifelse(EducationField=="Life Sciences",1,0), Edfield_Marketing=ifelse(EducationField=="Marketing",1,0), Edfield_other=ifelse(EducationField=="Other",1,0), Edfield_Tech=ifelse(EducationField=="Technical Degree",1,0), Gender_Male=ifelse(
+Gender=="Male",1,0), JobRole_Healthcare=ifelse(JobRole=="Healthcare Representative",1,0), JobRole_HR=ifelse(JobRole=="Human Resources",1,0), JobRole_LabTech=ifelse(JobRole=="Laboratory Technician",1,0), JobRole_Manager=ifelse(JobRole=="Manager",1,0), 
+JobRole_MNFDir=ifelse(JobRole=="Manufacturing Director",1,0), JobRole_ResDir=ifelse(JobRole=="Research Director",1,0),  JobRole_SalesExec=ifelse(JobRole=="Sales Executive",1,0), JobRole_SalesRep=ifelse(JobRole=="Sales Representative",1,0), JobRole_ResSci=ifelse(JobRole=="Research Scientist",1,0), MaritalStatus_Divorced=ifelse(MaritalStatus=="Divorced",1,0), MaritalStatus_Single=ifelse(MaritalStatus=="Single",1,0),  OverTime_Yes=ifelse(OverTime=="Yes",1,0))
+
+# Remove Categorical Variables that were dummy-coded
+ibm_data_dummy[,c("Attrition","BusinessTravel","Department","EducationField","Gender","JobRole",
+            "MaritalStatus","Over18","OverTime")]=NULL
+
+```
+
+I remove three variables (EmployeeCount, EmployeeNumber, and StandardHours) that were constant across persons or non-informative.
+
+```{r}
+ibm_data_dummy[,c("EmployeeCount","EmployeeNumber","StandardHours")] = NULL
+```
+
+```{r}
+# Convert Variables to Ordinal and Nominal Variables
+ibm_data$Attrition = factor(ibm_data$Attrition)
+ibm_data$BusinessTravel = factor(ibm_data$BusinessTravel)
+ibm_data$Department = factor(ibm_data$Department)
+ibm_data$EducationField = factor(ibm_data$EducationField)
+ibm_data$Gender = factor(ibm_data$Gender)
+ibm_data$MaritalStatus = factor(ibm_data$MaritalStatus)
+ibm_data$JobRole = factor(ibm_data$JobRole)
+ibm_data$OverTime = factor(ibm_data$OverTime)
+
+# Remove 'Non-informative' Variables
+ibm_data[,c("EmployeeCount","EmployeeNumber","StandardHours","Over18")] = NULL
+```
+
+## PCA on Quantitative Variables
+
+PCA (Principal Component Analysis) extracts orthogonal (un-correlated) linear weighted combination of our original variables that explain the greatest amount of variance across persons.  PCA can be thought of as attempting to account for the relationships among variables in the variance-covariance matrix with a smaller number of latent variables. If the original variables are z-score normalized beforehand, we are operating on a correlation matrix, rather than variance-covariance matrix. Your first principal component will explain the most amount of variance, followed by the second, then the third, and so forth.
+
+```{r}
+# Run PCA on Numeric Variables
+  scaled_numeric = select_if(ibm_data,is.numeric) %>% scale()
+  pca_results = princomp(scaled_numeric,cor=TRUE,scores=TRUE)
+  # Choose Num of Components (k)
+  k = 4
+  rotated_loadings_pca = varimax(pca_results$loadings[,1:k],normalize=TRUE)
+  rotated_scores_pca = scaled_numeric %*% rotated_loadings_pca$loadings
+  for (i in 1:k){
+    nam <- paste("plot_", i, sep = "")
+    temp_loadings_data = data.frame(label=colnames(scaled_numeric),loading=rotated_loadings_pca$loadings[,i])
+    plot_temp = ggplot(data=temp_loadings_data,aes(x=label,y=loading)) + geom_bar(stat="identity",fill="steelblue") + coord_flip() +  theme(axis.text.x = element_text(size=6))
+    assign(nam, plot_temp)
+
+  }
+  grid.arrange(plot_1,plot_2,plot_3,plot_4,ncol=2,nrow=2)
+
+```
+Interpretation of the four rotated principal components of the continuous variables are straightforward:
+
+1. The first component seems to represent 'experience at IBM'. Years with current manager and years at company have high negative loadings on this component while number of companies have high postive loadings. Thus, employees with high scores on this component are relatively inexperienced at IBM.
+
+2. The second component seems to represent 'experience in the workforce', with high positive loadings for age, job level, number of companies worked, and total working years.
+
+3. The third component seems to represent 'performance at IBM', with high negative loadings for performance rating and percent salary hike. Thus, employees who score high on this variable tend to have lower performance at IBM, and their lower salary hikes reflect that.
+
+4. The fourth component could roughly represent 'Job Involvement'. I chose this interpretation because of the high loading for job involvement, stock option level and hourly rate. However, the high negative loading for monthly rate is a bit confusing: how could monthly and hourly rate have opposite loadings?
+
+
+## Multiple Correspondence Analysis
+
+We also want to look at the multivariate relationships between nominal variables (Department, Job Role, Maritial Status, etc.)
+
+Compute the Burt Table of all the categories. Below is the Burt table of the nominal variables in the IBM dataset.
+```{r}
+ibm_cat = select_if(ibm_data,is.factor)
+burt_IBM = burt(ibm_cat)
+# Visualize
+kable(burt_IBM) %>%
+  kable_styling(bootstrap_options = c("hover","condensed"))
+```
+Below we apply the MCA algorithm to the Burt Matrix of our nominal variables in the IBM dataset. We choose to estimate 4 principal components, and apply a varimax rotation for interpretation.
+
+```{r}
+# Run Multiple Correspondence Analysis
+ibm_cat = select_if(ibm_data,is.factor)
+mca_res = MCA(ibm_cat,graph=FALSE)
+# Choose Number of Components
+k = 4
+rotated_loadings_mca = varimax(mca_res$var$coord[,1:k],normalize=TRUE)
+  for (i in 1:k){
+    nam <- paste("plot_", i, sep = "")
+    temp_loadings_data = data.frame(label=rownames(mca_res$var$coord),loading=rotated_loadings_mca$loadings[,i])
+    plot_temp = ggplot(data=temp_loadings_data,aes(x=label,y=loading)) + geom_bar(stat="identity",fill="steelblue") + coord_flip() +  theme(axis.text.x = element_text(size=5)) + ylab("Category") + xlab("Rotated Loading") + ggtitle(paste("Component ",as.character(i)," Loadings",sep=""))
+    assign(nam, plot_temp)
+
+  }
+  grid.arrange(plot_1,plot_2,plot_3,plot_4,ncol=2,nrow=2)
+
+```
+
+Interpretation of the four rotated principal components of the nominal variable categories are straightforward:
+
+1. The first component are categories that clearly indicate an employee works for the HR department.
+
+2. The second component are categories that indicating an employee works in the sales department.
+
+3. Interestingly, the third component seems relevant to employee attrition. Employee Attrition has strong loadings on this component. In addition, sales representatives have strong loadings on this component, which may indicate this job role has higher attrition than other roles.
+
+4. The fourth component looks to be a mixed bag. It possibly represents categories belonging predominantly to higher level positions: high negative weights on non-travel, and lab technician; high positive weights on higher up job roles (Director, Manager).
+
+# Clustering IBM Employees
+The next step in our exploratory analysis of the IBM dataset are to identify grouping of employees. The IBM dataset provides a number of variables to group our employees: Job Role, Department, Gender. The value of clustering in an exploratory approach is to identify groups of observations that are similar on a variety of variables (salary, environmental satisfaction, years at company), but don't fit into any of the a priori groupings. 
+
+## Gower's Distance
+Below we plot the Gower's Distance matrix between all employees in the IBM dataset. 
+
+```{r}
+Dist_gower = daisy(ibm_data,stand=TRUE)
+image(1:nrow(ibm_data),1:nrow(ibm_data),as.matrix(Dist_gower), axes = FALSE, xlab="Employee", ylab="Employee")
+
+```
+
+## tSNE (t-Distributed Stochastic Neighbor Embedding) Visualization
+
+The next step in our exploratory analysis is to identify grouping of IBM employees using the Gower's distance between them. We're going to use a combination of tSNE and density clustering (DBSCAN).
+
+```{r}
+   tsne_gower = Rtsne(Dist_gower,dims=2,perplexity=40,verbose=FALSE,is_distance=TRUE,max_iter=5000)
+    tsne_res_data = data.frame(tsne_Axis1 = tsne_gower$Y[,1],tsne_Axis2 = tsne_gower$Y[,2])
+    ggplot(data=tsne_res_data,aes(x = tsne_Axis1, y= tsne_Axis2)) + geom_point() + ggtitle('tSNE of IBM Employees')
+```
+So, that doesn't look too good at the parameters we've chosen. Possibly two clusters, but definitely doesn't jump out of the solution. 
+
+We use euclidean distance to compute the distance between employees, as opposed to Gower's distance.
+
+```{r}
+# 1. Concatenate MCA and PCA Scores and Z-score
+    ibm_pc_mca_scores = data.frame(PC_Comp = pca_results$scores[,1:4], MCA_Comp = mca_res$ind$coord[,1:4])
+    ibm_pc_mca_scores = data.table(scale(as.matrix(ibm_pc_mca_scores)))
+# 2. Compute Distance Matrix
+    Dist_ibm = dist(ibm_pc_mca_scores,method="euclidean")
+# 3. Run tSNE
+    tsne_res = Rtsne(Dist_ibm,dims=2,perplexity=40,verbose=FALSE,is_distance=TRUE,max_iter=5000)
+    tsne_res_data = data.frame(tsne_Axis1 = tsne_res$Y[,1],tsne_Axis2 = tsne_res$Y[,2])
+# 4. Visualize
+    ggplot(data=tsne_res_data,aes(x = tsne_Axis1, y= tsne_Axis2)) + geom_point()
+
+```
+
+Great! With the above parameters to the tSNE, it seems we get a pretty good four cluster solution. In addition, this four cluster solution seems to be fairly robust across parameters. 
+
+## Density Clustering
+We choose an epsilon value 4 because this returns the clusters we see visually. Below are the clusters grouped by color in the tSNE solution.
+
+```{r}
+# Visualize Clustering Solution from tSNE
+D = dist(tsne_res$Y,'euclidean')
+dbscan_res = dbscan(D,3.5)
+tsne_res_data["Cluster"] = as.factor(dbscan_res$cluster)
+ggplot(data=tsne_res_data,aes(x = tsne_Axis1, y= tsne_Axis2, color=Cluster)) + geom_point()
+```
+## Interpreting Clusters of the IBM Dataset
+Now that we have four clusters of employees in the dataset. Let's take a look at the characteristics of these clusters.
+
+```{r}
+ibm_cat = select_if(ibm_data,is.factor)
+ibm_cat_cluster = ibm_cat
+ibm_cat_cluster$cluster = as.factor(dbscan_res$cluster)
+# Plot w/ Attrition
+ibm_cat_subset = ibm_cat_cluster[,c(1,ncol(ibm_cat_cluster)),with=FALSE]
+cont_table = table(ibm_cat_subset)
+balloonplot(t(cont_table), main ="Attrition by Cluster", xlab ="Cluster",ylab="Attrition",
+            label = FALSE, show.margins = FALSE)
+# Plot w/ Job Role
+ibm_cat_subset = ibm_cat_cluster[,c(6,ncol(ibm_cat_cluster)),with=FALSE]
+cont_table = table(ibm_cat_subset)
+balloonplot(t(cont_table), main ="Job Role by Cluster", xlab ="Cluster",ylab="Job Role",
+            label = FALSE, show.margins = FALSE)
+# Plot w/ Gender
+ibm_cat_subset = ibm_cat_cluster[,c(5,ncol(ibm_cat_cluster)),with=FALSE]
+cont_table = table(ibm_cat_subset)
+balloonplot(t(cont_table), main ="Gender by Cluster", xlab ="Cluster",ylab="Gender",
+            label = FALSE, show.margins = FALSE)
+```
+
+Looking at the job role by cluster membership contingency table, we get a good dea of what sort of IBM employess are grouped in each cluster: 
+
+1. Cluster 1 (N = 346) clearly contains those IBM employees in the the sales department (sales executive, and sales representative). In addition, employees in this cluster have the highest attrition rate (30%) of any cluster.  
+
+2. Clusters 2 (N = 217) and 3 (N = 849) are difficult to distinguish based off job role, as there seems to be an equal distribution of job roles between each cluster. They also have seem to have an equal attrition rate (~18% and ~14%, respectively).  
+
+3. Cluster 4 (N = 58) clearly contains HR employees. This is a notably smaller cluster than the others, and has a fairly high attrition rate (~26%).
+
+```{r}
+## Plot Numeric Data by Cluster
+ibm_numeric = select_if(ibm_data,is.numeric)
+ibm_numeric$cluster = as.factor(dbscan_res$cluster)
+# Select Some Numeric Variables
+ibm_numeric_subset = select(ibm_numeric,c("Age","Education","EnvironmentSatisfaction","JobInvolvement","JobLevel","JobSatisfaction","MonthlyIncome","PerformanceRating","NumCompaniesWorked","RelationshipSatisfaction","WorkLifeBalance","YearsAtCompany","YearsInCurrentRole","cluster"))
+ibm_numeric_subset = ibm_numeric_subset %>% filter(cluster!=0)
+ibm_numeric_mean = ibm_numeric_subset %>% group_by(cluster) %>% summarize_all(mean)
+ibm_numeric_mean_scaled = ibm_numeric_mean[,-1] %>% as.matrix() %>% scale() %>% data.frame()
+ibm_numeric_mean_scaled$cluster = ibm_numeric_mean$cluster
+long_numeric_mean = melt(ibm_numeric_mean_scaled,id.vars="cluster")
+ggplot(long_numeric_mean,aes(x=variable,y=value,fill=cluster))+ geom_bar(stat="identity",position = position_dodge(0.75), width = 0.5) + xlab("Variable")+ylab("Normalized Mean Score") + coord_flip()
+```
+Looking at the mean differences between clusters 2 and 3, we see some striking differences. First, cluster 3 has greater education, higher job involvement, higher monthly income, higher relationship satisfaction and a much greater performance rating than cluster 2. Thus, it seems cluster 3 contains more skilled and high-performing employees than cluster 2.
+
+```{r}
+data("refinery")
+plot(refinery$Time,refinery$Tray47,pch='.', xlab = 'time', ylab='Tray 47 level')
+plot(refinery$Time,refinery$Reflux,type = 'p', xlab = 'time', ylab = 'reflux flow')
+```
+
+
