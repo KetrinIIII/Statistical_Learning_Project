@@ -1,3 +1,5 @@
+Employee Attrition: Investigating Why Workers Quit
+
 The project seeks to uncover the factors driving attrition at IBM by applying a diverse set of 
 statistical learning techniques to a rich HR dataset. 
 
